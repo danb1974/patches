@@ -1,0 +1,5 @@
+samba-3.6.3-missing-gss-buffer-desc-init.patch
+
+Missing initializations that, combined with a bug in krb5
+libraries will lead to smbd crashing when servicing
+remote registry requests
