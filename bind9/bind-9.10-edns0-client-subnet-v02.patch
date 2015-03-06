@@ -1,0 +1,264 @@
+diff -urN -xMakefile -xMakefile-postinstall -xrules -xconfig.log -xconfig.status -xincludes -xDoxyfile bind-9.10.1-P1/bin/named/client.c bind-9.10.1-P1-edns0/bin/named/client.c
+--- bind-9.10.1-P1/bin/named/client.c	2014-11-21 01:56:37.000000000 +0200
++++ bind-9.10.1-P1-edns0/bin/named/client.c	2015-01-14 10:06:48.116479515 +0200
+@@ -1466,19 +1466,25 @@
+ }
+ 
+ static inline isc_boolean_t
+-allowed(isc_netaddr_t *addr, dns_name_t *signer, dns_acl_t *acl) {
++allowed_with_client_subnet(isc_netaddr_t *addr, isc_netaddr_t *clientaddr,
++			   dns_name_t *signer, dns_acl_t *acl) {
+ 	int match;
+ 	isc_result_t result;
+ 
+ 	if (acl == NULL)
+ 		return (ISC_TRUE);
+-	result = dns_acl_match(addr, signer, acl, &ns_g_server->aclenv,
++	result = dns_acl_match_with_client_subnet(addr, clientaddr, signer, acl, &ns_g_server->aclenv,
+ 			       &match, NULL);
+ 	if (result == ISC_R_SUCCESS && match > 0)
+ 		return (ISC_TRUE);
+ 	return (ISC_FALSE);
+ }
+ 
++static inline isc_boolean_t
++allowed(isc_netaddr_t *addr, dns_name_t *signer, dns_acl_t *acl) {
++	return allowed_with_client_subnet(addr, NULL, signer, acl);
++}
++
+ /*
+  * Callback to see if a non-recursive query coming from 'srcaddr' to
+  * 'destaddr', with optional key 'mykey' for class 'rdclass' would be
+@@ -1543,6 +1549,83 @@
+ 	return (ISC_TF(view == myview));
+ }
+ 
++/*
++ * Parse EDNS0 client subnet option. `optlen` is the length of the
++ * option after the code and the length. It will be updated to reflect
++ * with what has been read.
++ */
++static isc_result_t
++client_parse_clientsubnet(ns_client_t *client, isc_buffer_t *rdbuf, isc_uint16_t *optlen) {
++	isc_uint16_t family;
++	isc_uint8_t addrlen; /* Source netmask */
++	isc_uint8_t addrbytes;
++	isc_uint8_t scopelen; /* Scope netmask */
++	isc_netaddr_t clientaddr;
++	isc_uint8_t *paddr;
++	int i;
++
++	REQUIRE(NS_CLIENT_VALID(client));
++	REQUIRE(rdbuf != NULL);
++	REQUIRE(optlen != 0);
++	INSIST(isc_buffer_remaininglength(rdbuf) >= *optlen);
++
++	if (*optlen < 4) {
++		/* 2 octets for family, 1 octet for source netmask and
++		 * 1 octet for scope netmask */
++		ns_client_log(client, NS_LOGCATEGORY_CLIENT,
++			      NS_LOGMODULE_CLIENT, ISC_LOG_DEBUG(2),
++			      "EDNS0 client subnet option is too short");
++		return DNS_R_FORMERR;
++	}
++	
++	family = isc_buffer_getuint16(rdbuf);
++	addrlen = isc_buffer_getuint8(rdbuf);
++	scopelen = isc_buffer_getuint8(rdbuf);
++	*optlen -= 4;
++	
++	if (scopelen != 0) {
++		ns_client_log(client, NS_LOGCATEGORY_CLIENT,
++			      NS_LOGMODULE_CLIENT, ISC_LOG_DEBUG(2),
++			      "EDNS0 client subnet scope is not 0");
++		return DNS_R_FORMERR;
++	}
++
++	memset(&clientaddr, 0, sizeof(clientaddr));
++	switch (family) {
++		case 1:
++			/* IPv4 */
++			if (addrlen > 32) addrlen = 32;
++			clientaddr.family = AF_INET;
++			break;
++		case 2:
++			/* IPv6 */
++			if (addrlen > 128) addrlen = 128;
++			clientaddr.family = AF_INET6;
++			break;
++		default:
++			/* Dunno what to do, let's skip all. */
++			return DNS_R_FORMERR;
++	}
++
++	addrbytes = (addrlen + 7) / 8;
++	if (*optlen < addrbytes) {
++		ns_client_log(client, NS_LOGCATEGORY_CLIENT,
++			      NS_LOGMODULE_CLIENT, ISC_LOG_DEBUG(2),
++			      "EDNS0 client subnet address is too short");
++		return DNS_R_FORMERR;
++	}
++	paddr = (isc_uint8_t*)&clientaddr.type;
++	for (i = 0; i < addrbytes; i++) {
++		paddr[i] = isc_buffer_getuint8(rdbuf);
++	}
++	*optlen -= i;
++	
++	memcpy(&client->clientaddr, &clientaddr, sizeof(clientaddr));
++	client->clientaddrlen = addrlen;
++	client->clientscopelen = 0;
++	return ISC_R_SUCCESS;
++} 
++
+ #ifdef ISC_PLATFORM_USESIT
+ static void
+ compute_sit(ns_client_t *client, isc_uint32_t when, isc_uint32_t nonce,
+@@ -1767,6 +1850,10 @@
+ 		dns_rdataset_current(opt, &rdata);
+ 		isc_buffer_init(&optbuf, rdata.data, rdata.length);
+ 		isc_buffer_add(&optbuf, rdata.length);
++		/* otherwise we reuse last client subnet */
++		memset(&client->clientaddr, 0, sizeof(client->clientaddr));
++		client->clientaddrlen = 0;
++		client->clientscopelen = 0;
+ 		while (isc_buffer_remaininglength(&optbuf) >= 4) {
+ 			optcode = isc_buffer_getuint16(&optbuf);
+ 			optlen = isc_buffer_getuint16(&optbuf);
+@@ -1777,6 +1864,13 @@
+ 				client->attributes |= NS_CLIENTATTR_WANTNSID;
+ 				isc_buffer_forward(&optbuf, optlen);
+ 				break;
++			case DNS_OPT_CLIENT_SUBNET:
++				client_parse_clientsubnet(client, &optbuf, &optlen);
++				if (optlen > 0) {
++					/* incomplete buffer parsing due to error */
++					isc_buffer_forward(&optbuf, optlen);
++				}
++				break;
+ #ifdef ISC_PLATFORM_USESIT
+ 			case DNS_OPT_SIT:
+ 				process_sit(client, &optbuf, optlen);
+@@ -2123,7 +2217,9 @@
+ 			if (sigresult == ISC_R_SUCCESS)
+ 				tsig = dns_tsigkey_identity(client->message->tsigkey);
+ 
+-			if (allowed(&netaddr, tsig, view->matchclients) &&
++			if (allowed_with_client_subnet(&netaddr,
++						       client->clientaddrlen?&client->clientaddr:NULL,
++						       tsig, view->matchclients) &&
+ 			    allowed(&client->destaddr, tsig,
+ 				    view->matchdestinations) &&
+ 			    !((client->message->flags & DNS_MESSAGEFLAG_RD)
+@@ -2519,6 +2615,8 @@
+ 	client->recursionquota = NULL;
+ 	client->interface = NULL;
+ 	client->peeraddr_valid = ISC_FALSE;
++	client->clientaddrlen = 0;
++	client->clientscopelen = 0; 
+ #ifdef ALLOW_FILTER_AAAA
+ 	client->filter_aaaa = dns_aaaa_ok;
+ #endif
+diff -urN -xMakefile -xMakefile-postinstall -xrules -xconfig.log -xconfig.status -xincludes -xDoxyfile bind-9.10.1-P1/bin/named/include/named/client.h bind-9.10.1-P1-edns0/bin/named/include/named/client.h
+--- bind-9.10.1-P1/bin/named/include/named/client.h	2014-11-21 01:56:37.000000000 +0200
++++ bind-9.10.1-P1-edns0/bin/named/include/named/client.h	2015-01-09 15:30:56.658747308 +0200
+@@ -140,6 +140,9 @@
+ 	isc_sockaddr_t		peeraddr;
+ 	isc_boolean_t		peeraddr_valid;
+ 	isc_netaddr_t		destaddr;
++	isc_netaddr_t		clientaddr;
++	isc_uint8_t		clientaddrlen;
++	isc_uint8_t		clientscopelen; 
+ 	struct in6_pktinfo	pktinfo;
+ 	isc_dscp_t		dscp;
+ 	isc_event_t		ctlevent;
+diff -urN -xMakefile -xMakefile-postinstall -xrules -xconfig.log -xconfig.status -xincludes -xDoxyfile bind-9.10.1-P1/lib/dns/acl.c bind-9.10.1-P1-edns0/lib/dns/acl.c
+--- bind-9.10.1-P1/lib/dns/acl.c	2014-11-21 01:56:37.000000000 +0200
++++ bind-9.10.1-P1-edns0/lib/dns/acl.c	2015-01-13 17:42:24.007596416 +0200
+@@ -194,6 +194,19 @@
+ 	      int *match,
+ 	      const dns_aclelement_t **matchelt)
+ {
++	return dns_acl_match_with_client_subnet(reqaddr, NULL, reqsigner, acl,
++						env, match, matchelt);
++}
++
++isc_result_t
++dns_acl_match_with_client_subnet(const isc_netaddr_t *reqaddr,
++	      const isc_netaddr_t *clientaddr,
++	      const dns_name_t *reqsigner,
++	      const dns_acl_t *acl,
++	      const dns_aclenv_t *env,
++	      int *match,
++	      const dns_aclelement_t **matchelt)
++{
+ 	isc_uint16_t bitlen, family;
+ 	isc_prefix_t pfx;
+ 	isc_radix_node_t *node = NULL;
+@@ -245,7 +258,7 @@
+ 			return (ISC_R_SUCCESS);
+ 		}
+ 
+-		if (dns_aclelement_match(reqaddr, reqsigner,
++		if (dns_aclelement_match_with_client_subnet(reqaddr, clientaddr, reqsigner,
+ 					 e, env, matchelt)) {
+ 			if (match_num == -1 || e->node_num < match_num) {
+ 				if (e->negative == ISC_TRUE)
+@@ -387,6 +400,17 @@
+ 		     const dns_aclenv_t *env,
+ 		     const dns_aclelement_t **matchelt)
+ {
++	return dns_aclelement_match_with_client_subnet(reqaddr, NULL, reqsigner, e, env, matchelt);
++}
++
++isc_boolean_t
++dns_aclelement_match_with_client_subnet(const isc_netaddr_t *reqaddr,
++		     const isc_netaddr_t *clientaddr,
++		     const dns_name_t *reqsigner,
++		     const dns_aclelement_t *e,
++		     const dns_aclenv_t *env,
++		     const dns_aclelement_t **matchelt)
++{
+ 	dns_acl_t *inner = NULL;
+ 	int indirectmatch;
+ 	isc_result_t result;
+@@ -421,7 +445,7 @@
+ 	case dns_aclelementtype_geoip:
+ 		if (env == NULL || env->geoip == NULL)
+ 			return (ISC_FALSE);
+-		return (dns_geoip_match(reqaddr, env->geoip, &e->geoip_elem));
++		return (dns_geoip_match(clientaddr?clientaddr:reqaddr, env->geoip, &e->geoip_elem));
+ #endif
+ 	default:
+ 		/* Should be impossible. */
+diff -urN -xMakefile -xMakefile-postinstall -xrules -xconfig.log -xconfig.status -xincludes -xDoxyfile bind-9.10.1-P1/lib/dns/include/dns/acl.h bind-9.10.1-P1-edns0/lib/dns/include/dns/acl.h
+--- bind-9.10.1-P1/lib/dns/include/dns/acl.h	2014-11-21 01:56:37.000000000 +0200
++++ bind-9.10.1-P1-edns0/lib/dns/include/dns/acl.h	2015-01-13 16:19:42.502993643 +0200
+@@ -212,6 +212,14 @@
+ 	      const dns_aclenv_t *env,
+ 	      int *match,
+ 	      const dns_aclelement_t **matchelt);
++isc_result_t
++dns_acl_match_with_client_subnet(const isc_netaddr_t *reqaddr,
++	      const isc_netaddr_t *clientaddr,
++	      const dns_name_t *reqsigner,
++	      const dns_acl_t *acl,
++	      const dns_aclenv_t *env,
++	      int *match,
++	      const dns_aclelement_t **matchelt);
+ /*%<
+  * General, low-level ACL matching.  This is expected to
+  * be useful even for weird stuff like the topology and sortlist statements.
+@@ -243,6 +251,13 @@
+ 		     const dns_name_t *reqsigner,
+ 		     const dns_aclelement_t *e,
+ 		     const dns_aclenv_t *env,
++		     const dns_aclelement_t **matchelt);
++isc_boolean_t
++dns_aclelement_match_with_client_subnet(const isc_netaddr_t *reqaddr,
++		     const isc_netaddr_t *clientaddr,
++		     const dns_name_t *reqsigner,
++		     const dns_aclelement_t *e,
++		     const dns_aclenv_t *env,
+ 		     const dns_aclelement_t **matchelt);
+ /*%<
+  * Like dns_acl_match, but matches against the single ACL element 'e'

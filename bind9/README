@@ -1,0 +1,8 @@
+Based on the bind9 edns patch made by
+Vincent Bernat <vincent.bernat@dailymotion.com>
+
+Adapted for bind 9.10 by me
+
+This is a hack. It is not configurable.
+It only works for zones for which your server is authoritative.
+And it only works on geoip views (duh).
