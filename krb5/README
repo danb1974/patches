@@ -1,0 +1,4 @@
+krb5-1.10-naming-exts-display-value.diff
+
+One liner that has not been backported to ubuntu 12.04
+In conjunction with a samba bug will lead to smbd crashing
