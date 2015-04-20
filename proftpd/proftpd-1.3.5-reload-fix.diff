@@ -1,0 +1,90 @@
+--- proftpd.orig	2015-04-20 09:44:55.730398539 +0300
++++ proftpd	2015-04-20 10:31:07.583932791 +0300
+@@ -90,37 +90,36 @@
+     fi
+ }
+ 
+-signal()
++stop()
+ {
+-
+-    if [ "$1" = "stop" ]; then
+-		SIGNAL="TERM"
+-    	log_daemon_msg "Stopping ftp server" "$NAME"
+-    else
+-	if [ "$1" = "reload" ]; then
+-	    SIGNAL="HUP"
+-    	log_daemon_msg "Reloading ftp server" "$NAME"
+-	else
+-	    echo "ERR: wrong parameter given to signal()"
++    log_daemon_msg "Stopping ftp server" "$NAME"
++    start-stop-daemon --stop --signal TERM --quiet --pidfile "$PIDFILE" --retry=TERM/1/KILL/10
++    if [ $? != 0 ]; then
++        log_end_msg 1
++        if [ $1 != 1 ]; then
+ 	    exit 1
+ 	fi
++    else
++        log_end_msg 0
++    fi
++}
++
++signal()
++{
++    if [ "$1" = "reload" ]; then
++	SIGNAL="HUP"
++	log_daemon_msg "Reloading ftp server" "$NAME"
++    else
++	echo "ERR: wrong parameter given to signal()"
++	exit 1
+     fi
+     if [ -f "$PIDFILE" ]; then
+     	start-stop-daemon --stop --signal $SIGNAL --quiet --pidfile "$PIDFILE"
+-   	 if [ $? = 0 ]; then
+-        	log_end_msg 0
++	sleep 1
++  	if [ $? = 0 ]; then
++            log_end_msg 0
+     	else
+-		SIGNAL="KILL"
+-		start-stop-daemon --stop --signal $SIGNAL --quiet --pidfile "$PIDFILE" --retry=TERM/10/KILL/5
+-    		if [ $? != 0 ]; then
+-        		log_end_msg 1
+-        		[ $2 != 0 ] || exit 0
+-    		else
+-        		log_end_msg 0
+-    		fi
+-    	fi
+-   	if [ "$SIGNAL" = "KILL" ]; then
+-		rm -f "$PIDFILE"
++       	    log_end_msg 1
+     	fi
+     else
+         log_end_msg 0
+@@ -151,7 +150,7 @@
+     
+     stop)
+ 	if [ "x$RUN" = "xyes" ] ; then
+-	    signal stop 0
++	    stop 0
+ 	else
+ 	    if [ "x$INETD" = "xyes" ] ; then
+ 		echo "ProFTPD is started from inetd/xinetd."
+@@ -167,7 +166,7 @@
+ 	    echo "Warning: ProFTPD is started from inetd/xinetd (trying to kill anyway)."
+ 		inetd_check
+ 	fi
+-	signal stop 0
++        stop 0
+ 	;;
+ 
+     reload)
+@@ -176,7 +175,7 @@
+ 
+     force-reload|restart)
+ 	if [ "x$RUN" = "xyes" ] ; then
+-	    signal stop 1
++	    stop 1
+ 	    start
+ 	else
+ 	    if [ "x$INETD" = "xyes" ] ; then
